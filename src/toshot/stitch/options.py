@@ -14,10 +14,12 @@ class StitchOptions:
     rs_readout_fraction: float = 0.7
     # Selfie-stick: fraction of equirect height at the nadir to inspect
     selfie_nadir_fraction: float = 0.12
-    # Optical-flow analysis scale (1 = full, 0.25 = quarter)
-    flow_scale: float = 0.25
-    # Soft blend half-width around the carved seam (equirect pixels at full res)
-    seam_blend_px: int = 8
+    # Match / align scale (1 = full, 0.25 = quarter)
+    flow_scale: float = 0.4
+    # Feather width across the hard cut edges (0 = hard cut, no overlap blend)
+    seam_blend_px: int = 5
+    # Expand seam strip for near-field parallax align + hard cut (full-res px)
+    seam_expand_px: int = 120
 
     @property
     def advanced(self) -> bool:

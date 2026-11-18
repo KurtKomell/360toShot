@@ -11,11 +11,19 @@ struct Uniforms {
     eq_w: f32,
     eq_h: f32,
     _pad: f32,
+    stab0: vec4<f32>,
+    stab1: vec4<f32>,
+    stab2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var eq_tex: texture_2d<f32>;
+
+// Gyro stabilization: view direction → stitched lens-frame direction
+fn apply_stab(v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(u.stab0.xyz, v), dot(u.stab1.xyz, v), dot(u.stab2.xyz, v));
+}
 
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
@@ -62,7 +70,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let fov = deg2rad(max(u.fov_deg, 1.0));
     let f = 1.0 / tan(fov * 0.5);
     var dir = normalize(vec3<f32>(ndc.x * u.aspect / f, ndc.y / f, 1.0));
-    dir = rotate_ypr(dir, u.yaw, u.pitch, u.roll);
+    dir = apply_stab(rotate_ypr(dir, u.yaw, u.pitch, u.roll));
     let lon = atan2(dir.x, dir.z);
     let lat = asin(clamp(dir.y, -1.0, 1.0));
     let eq = clamp(vec2<f32>(
@@ -84,11 +92,18 @@ struct Uniforms {
     eq_w: f32,
     eq_h: f32,
     _pad: f32,
+    stab0: vec4<f32>,
+    stab1: vec4<f32>,
+    stab2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var rear_tex: texture_2d<f32>;
+
+fn apply_stab(v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(u.stab0.xyz, v), dot(u.stab1.xyz, v), dot(u.stab2.xyz, v));
+}
 @group(0) @binding(3) var front_tex: texture_2d<f32>;
 @group(0) @binding(4) var rear_x: texture_2d<f32>;
 @group(0) @binding(5) var rear_y: texture_2d<f32>;
@@ -172,7 +187,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let f = 1.0 / tan(fov * 0.5);
     // Camera ray in view space (+Y up, +Z forward)
     var dir = normalize(vec3<f32>(ndc.x * u.aspect / f, ndc.y / f, 1.0));
-    dir = rotate_ypr(dir, u.yaw, u.pitch, u.roll);
+    dir = apply_stab(rotate_ypr(dir, u.yaw, u.pitch, u.roll));
 
     // Direction → equirect UV
     let lon = atan2(dir.x, dir.z);           // -pi..pi

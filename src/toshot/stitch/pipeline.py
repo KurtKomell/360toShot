@@ -14,18 +14,52 @@ from toshot.ffmpeg_bin import (
     EncoderChoice,
     audio_encode_args,
     choose_video_encoder,
-    escape_filter_path,
     ffmpeg_path,
-    has_filter,
 )
-from toshot.math3d import frame_rotations
+from toshot.math3d import stabilization_matrices
 from toshot.parallel import stitch_workers
 from toshot.source.models import AttitudeSample, Capture, LensLayout, LensParams, StabMode
 from toshot.stitch.advanced import blend_advanced
 from toshot.stitch.options import StitchOptions
-from toshot.stitch.remap import blend_weights, build_lens_maps, feather_px_for, write_pgm_pair
+from toshot.stitch.remap import (
+    blend_weights,
+    build_lens_maps,
+    feather_px_for,
+    sphere_fov_for_pair,
+    write_pgm_pair,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _build_pair_maps(
+    rear_s: LensParams, front_s: LensParams, out_w: int, out_h: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    sf = sphere_fov_for_pair(rear_s, front_s)
+    log.info(
+        "Kugel = Rear-FOV %.2f°, Front %.2f° überlappt (%.1f°)",
+        sf.fov_rear,
+        sf.fov_front,
+        sf.overlap_deg,
+    )
+    x0, y0, w0 = build_lens_maps(
+        rear_s,
+        out_w,
+        out_h,
+        fov_deg=sf.fov_rear,
+        blend_inner_deg=sf.rear_inner,
+        blend_outer_deg=sf.rear_outer,
+    )
+    x1, y1, w1 = build_lens_maps(
+        front_s,
+        out_w,
+        out_h,
+        ref_lens=rear_s,
+        fov_deg=sf.fov_front,
+        blend_inner_deg=sf.front_inner,
+        blend_outer_deg=sf.front_outer,
+    )
+    return x0, y0, w0, x1, y1, w1
 
 
 def write_sendcmd(path: Path, rotations: list[tuple[float, float, float]], fps: float) -> None:
@@ -106,8 +140,7 @@ def prepare_maps(
     rear_s = _scale_lens(rear, src_w, src_h)
     front_s = _scale_lens(front, src_w, src_h)
 
-    x0, y0, w0 = build_lens_maps(rear_s, out_w, out_h)
-    x1, y1, w1 = build_lens_maps(front_s, out_w, out_h, ref_lens=rear_s)
+    x0, y0, w0, x1, y1, w1 = _build_pair_maps(rear_s, front_s, out_w, out_h)
     a, _b = blend_weights(w0, w1, feather_px=feather_px_for(out_w))
 
     x0p, y0p = work / "rear_x.pgm", work / "rear_y.pgm"
@@ -146,7 +179,6 @@ def stitch_equirect(
     width: int | None = None,
     source: Path | None = None,
     encoder: EncoderChoice | None = None,
-    sendcmd_path: Path | None = None,
     work_dir: Path | None = None,
     options: StitchOptions | None = None,
     encode: EncodeSettings | None = None,
@@ -222,7 +254,6 @@ def stitch_equirect(
             out_h,
             feather_px_for(out_w),
         )
-        cmd_file = Path(sendcmd_path) if sendcmd_path else work / "stab.cmd"
         return _opencv_stitch(
             capture,
             src,
@@ -234,9 +265,7 @@ def stitch_equirect(
             fps,
             n_frames,
             options=StitchOptions.fast(),
-            spherical_stab=True,
             encode=cfg,
-            sendcmd_path=cmd_file,
         )
     finally:
         if tmp_own:
@@ -258,8 +287,7 @@ def _stitch_one_frame(
     options: StitchOptions,
     attitude: list[AttitudeSample],
     fps: float,
-    rotations: list[tuple[float, float, float]],
-    apply_rotation: bool = True,
+    rotations: list[np.ndarray],
 ) -> np.ndarray:
     mapped0 = cv2.remap(fr, x0, y0, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     mapped1 = cv2.remap(ff, x1, y1, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
@@ -279,10 +307,7 @@ def _stitch_one_frame(
         blended = (
             mapped0.astype(np.float32) * a[..., None] + mapped1.astype(np.float32) * b[..., None]
         ).astype(np.uint8)
-    yaw, pitch, roll = rotations[min(i, len(rotations) - 1)]
-    if not apply_rotation:
-        return blended
-    return _rotate_equirect_cv(blended, yaw, pitch, roll)
+    return rotate_equirect(blended, rotations[min(i, len(rotations) - 1)])
 
 
 def _opencv_stitch(
@@ -297,9 +322,7 @@ def _opencv_stitch(
     n_frames: int,
     *,
     options: StitchOptions,
-    spherical_stab: bool = False,
     encode: EncodeSettings | None = None,
-    sendcmd_path: Path | None = None,
 ) -> Path:
     rear = capture.calibration.rear
     front = capture.calibration.front or rear
@@ -324,16 +347,11 @@ def _opencv_stitch(
     )
     rear_s = _scale_lens(rear, src_w, src_h)
     front_s = _scale_lens(front, src_w, src_h)
-    x0, y0, w0 = build_lens_maps(rear_s, out_w, out_h)
-    x1, y1, w1 = build_lens_maps(front_s, out_w, out_h, ref_lens=rear_s)
+    x0, y0, w0, x1, y1, w1 = _build_pair_maps(rear_s, front_s, out_w, out_h)
     a, b = blend_weights(w0, w1, feather_px=feather_px_for(out_w))
-    rotations = frame_rotations(capture.attitude, fps, n_frames, stab)
-    use_v360 = spherical_stab and stab != StabMode.NONE and has_filter("v360")
-    if use_v360:
-        cmd_file = Path(sendcmd_path) if sendcmd_path else Path(tempfile.mkdtemp(prefix="toshot_stab_")) / "stab.cmd"
-        cmd_file.parent.mkdir(parents=True, exist_ok=True)
-        write_sendcmd(cmd_file, rotations, fps)
-        log.info("Stabilisierung über v360 (%s)", stab.value)
+    times = [i / fps if fps > 0 else 0.0 for i in range(n_frames)]
+    rotations = stabilization_matrices(capture.attitude or [], times, stab)
+    log.info("Stabilisierung (%s) per Gyro-Matrix, Horizont nach Schwerkraft", stab.value)
     log.info("Decoding lens streams and encoding %d frames …", n_frames)
 
     frames_r = _iter_lens_frames(capture, source, lens=0)
@@ -359,14 +377,7 @@ def _opencv_stitch(
     ]
     if has_audio:
         cmd += ["-i", str(source)]
-    if use_v360:
-        fc = (
-            f"[0:v]sendcmd=f={escape_filter_path(cmd_file)},"
-            f"v360=input=e:output=e:yaw=0:pitch=0:roll=0:w={out_w}:h={out_h}[vout]"
-        )
-        cmd += ["-filter_complex", fc, "-map", "[vout]"]
-    else:
-        cmd += ["-map", "0:v"]
+    cmd += ["-map", "0:v"]
     if has_audio:
         cmd += ["-map", "1:a:0?", *audio_encode_args(encode)]
     else:
@@ -418,7 +429,6 @@ def _opencv_stitch(
                         capture.attitude,
                         fps,
                         rotations,
-                        not use_v360,
                     )
                     next_submit = i + 1
                 return True
@@ -444,15 +454,36 @@ def _opencv_stitch(
     return output
 
 
-def _rotate_equirect_cv(img: np.ndarray, yaw: float, pitch: float, roll: float) -> np.ndarray:
-    if abs(yaw) < 1e-3 and abs(pitch) < 1e-3 and abs(roll) < 1e-3:
+_ROTATE_ROWS = 256
+
+
+def rotate_equirect(img: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Resample equirect so output direction d shows input direction s·d (full 3D rotation)."""
+    if np.allclose(s, np.eye(3), atol=1e-7):
         return img
     h, w = img.shape[:2]
-    shift_x = int(round((-yaw / 360.0) * w))
-    shift_y = int(round((pitch / 180.0) * h))
-    out = np.roll(img, shift_x, axis=1)
-    if shift_y:
-        out = np.roll(out, shift_y, axis=0)
+    s = np.asarray(s, dtype=np.float32)
+    lon = ((np.arange(w, dtype=np.float32) + 0.5) / w) * (2.0 * np.pi) - np.pi
+    lat = (0.5 - (np.arange(h, dtype=np.float32) + 0.5) / h) * np.pi
+    sin_lon, cos_lon = np.sin(lon)[None, :], np.cos(lon)[None, :]
+    out = np.empty_like(img)
+    # Row strips keep temporaries small at 8K
+    for r0 in range(0, h, _ROTATE_ROWS):
+        r1 = min(h, r0 + _ROTATE_ROWS)
+        la = lat[r0:r1, None]
+        cos_la, sin_la = np.cos(la), np.sin(la)
+        dx = cos_la * sin_lon
+        dz = cos_la * cos_lon
+        sx = s[0, 0] * dx + s[0, 1] * sin_la + s[0, 2] * dz
+        sy = s[1, 0] * dx + s[1, 1] * sin_la + s[1, 2] * dz
+        sz = s[2, 0] * dx + s[2, 1] * sin_la + s[2, 2] * dz
+        mx = (np.arctan2(sx, sz) + np.pi) * (w / (2.0 * np.pi)) - 0.5
+        my = (0.5 - np.arcsin(np.clip(sy, -1.0, 1.0)) / np.pi) * h - 0.5
+        # Clamp rows so BORDER_WRAP only wraps longitude, never pole→pole
+        my = np.clip(my, 0.0, h - 1.0)
+        out[r0:r1] = cv2.remap(
+            img, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP
+        )
     return out
 
 

@@ -136,3 +136,117 @@ def frame_rotations(
         q = slerp_attitude(samples, t)
         out.append(stabilization_rotation(q, mode, q0=q0))
     return out
+
+
+# equirect (x right, y up, z forward) → DJI camd/attitude frame (x forward, y left, z up)
+EQ_TO_DJI = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+
+
+def quat_to_matrix(q: Sequence[float]) -> np.ndarray:
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def world_to_stitch_matrix(q: Sequence[float]) -> np.ndarray:
+    """World direction (equirect axes, y up) → direction in the stitched lens-frame equirect."""
+    return EQ_TO_DJI.T @ quat_to_matrix(q).T @ EQ_TO_DJI
+
+
+def _yaw_matrix(psi: float) -> np.ndarray:
+    """Rotation about world up taking forward (0,0,1) to (sin ψ, 0, cos ψ)."""
+    c, s = math.cos(psi), math.sin(psi)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64)
+
+
+class AttitudeTrack:
+    """
+    Gyro attitude with outlier rejection.
+
+    DJI djmd interleaves the lens calibration quaternions with the fused
+    attitude (Osmo: first samples only; Avata 360: scattered through the clip),
+    so each lookup takes the sample nearest the window's median gravity.
+    """
+
+    def __init__(self, samples: Sequence[AttitudeSample], window_s: float = 0.05) -> None:
+        self.t = np.array([s.t_s for s in samples], dtype=np.float64)
+        self.q = np.array([[s.w, s.x, s.y, s.z] for s in samples], dtype=np.float64)
+        self.window_s = float(window_s)
+        if len(self.q):
+            self.q /= np.maximum(np.linalg.norm(self.q, axis=1, keepdims=True), 1e-12)
+            w, x, y, z = self.q.T
+            # Third row of R(q): world-up expressed in the attitude body frame
+            up_body = np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=1)
+            self.down_stitch = -(up_body @ EQ_TO_DJI)
+        else:
+            self.down_stitch = np.zeros((0, 3))
+
+    def __bool__(self) -> bool:
+        return len(self.t) > 0
+
+    def quat_at(self, t: float) -> tuple[float, float, float, float]:
+        if not len(self.t):
+            return (1.0, 0.0, 0.0, 0.0)
+        lo = int(np.searchsorted(self.t, t - self.window_s, side="left"))
+        hi = int(np.searchsorted(self.t, t + self.window_s, side="right"))
+        if hi <= lo:
+            i = int(min(max(np.searchsorted(self.t, t), 0), len(self.t) - 1))
+            return tuple(self.q[i])  # type: ignore[return-value]
+        g = self.down_stitch[lo:hi]
+        med = np.median(g, axis=0)
+        i = lo + int(np.argmax(g @ med))
+        return tuple(self.q[i])  # type: ignore[return-value]
+
+
+def _heading_axis(c0: np.ndarray) -> np.ndarray:
+    """Stitch-frame axis whose world heading defines 'forward' (z unless it points at a pole)."""
+    z_world = c0.T @ np.array([0.0, 0.0, 1.0])
+    if abs(z_world[1]) < 0.7:
+        return np.array([0.0, 0.0, 1.0])
+    return np.array([0.0, 1.0, 0.0])
+
+
+def _heading(c: np.ndarray, axis: np.ndarray) -> float:
+    a = c.T @ axis
+    return math.atan2(a[0], a[2])
+
+
+class Stabilizer:
+    """
+    3×3 S per time: output view direction → stitched lens-frame direction.
+
+    Gravity always goes straight down (works for any lens mounting, e.g. the
+    Avata 360's up/down lenses). HORIZON follows heading; LEVEL/WORLD lock it
+    to t_ref. NONE (or no gyro) is identity.
+    """
+
+    def __init__(self, samples: Sequence[AttitudeSample], mode: StabMode, t_ref: float = 0.0) -> None:
+        self.mode = mode
+        self.track = AttitudeTrack(samples) if samples and mode != StabMode.NONE else None
+        if self.track is None:
+            return
+        c_ref = world_to_stitch_matrix(self.track.quat_at(t_ref))
+        self.axis = _heading_axis(c_ref)
+        self.psi_ref = _heading(c_ref, self.axis)
+
+    def matrix(self, t: float) -> np.ndarray:
+        if self.track is None:
+            return np.eye(3, dtype=np.float64)
+        c = world_to_stitch_matrix(self.track.quat_at(float(t)))
+        psi = _heading(c, self.axis) if self.mode == StabMode.HORIZON else self.psi_ref
+        return c @ _yaw_matrix(psi)
+
+
+def stabilization_matrices(
+    samples: Sequence[AttitudeSample],
+    times: Sequence[float],
+    mode: StabMode,
+) -> list[np.ndarray]:
+    stab = Stabilizer(samples, mode, t_ref=float(times[0]) if len(times) else 0.0)
+    return [stab.matrix(t) for t in times]

@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 
+from toshot.preview.raw_lenses import run_raw_lenses_path
 from toshot.preview.viewer import run_preview_path
 from toshot.source.models import StabMode
 from toshot.stitch.options import StitchOptions
@@ -15,6 +16,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--stab", default="world", choices=[m.value for m in StabMode])
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
+    p.add_argument(
+        "--raw-lenses",
+        action="store_true",
+        help="Show rear|front fisheye side-by-side without stitching",
+    )
     p.add_argument(
         "--fast",
         action="store_true",
@@ -30,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    if args.raw_lenses:
+        run_raw_lenses_path(args.input)
+        return 0
     opts = StitchOptions.from_flags(
         optical_flow=not args.no_optical_flow,
         selfie_mask=not args.no_selfie_mask,

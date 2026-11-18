@@ -1,34 +1,94 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from toshot.math3d import EQ_TO_DJI, quat_to_matrix
 from toshot.source.models import LensParams
 
-# Osmo / OSVplat: read each lens to ~94°, blend only in the thin 87–93° ring.
+# Fallback when per-lens FOV cannot be measured (legacy / incomplete calib).
 LENS_FOV_DEG = 94.0
 BLEND_INNER_DEG = 87.0
 BLEND_OUTER_DEG = 93.0
 # Front-lens yaw trim about DJI z-up; seam patch matching on Osmo 360 puts both
 # seams at dx≈0 with −1° (0° left a uniform ~6 px lon offset at 2048 wide).
 FRONT_YAW_TRIM_DEG = -1.0
+# Keep a thin overlap ring inside the meet angle (degrees).
+_BLEND_RING_DEG = 6.0
+_FOV_EDGE_MARGIN_DEG = 0.5
 
-# equirect (x right, y up, z forward) → DJI camd world (x forward, y left, z up)
-_EQ_TO_DJI = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+
+def lens_max_fov_deg(lens: LensParams) -> float:
+    """
+    Largest ray angle that still projects inside the sensor (Kannala–Brandt).
+    Different fx/fy ⇒ different max FOV even for the same pixel circle.
+    """
+    fx, fy = float(lens.fx), float(lens.fy)
+    cx, cy = float(lens.cx), float(lens.cy)
+    w, h = float(lens.width), float(lens.height)
+    r_img = min(cx, cy, w - 1.0 - cx, h - 1.0 - cy)
+    f = 0.5 * (fx + fy)
+    if f < 1e-6 or r_img < 1.0:
+        return float(LENS_FOV_DEG)
+    k = list(lens.k) + [0.0] * 5
+    k1, k2, k3, k4, k5 = k[:5]
+
+    def theta_d(th: float) -> float:
+        t2 = th * th
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+        t10 = t8 * t2
+        return th * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8 + k5 * t10)
+
+    lo, hi = 0.0, math.radians(160.0)
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if f * theta_d(mid) < r_img:
+            lo = mid
+        else:
+            hi = mid
+    return float(math.degrees(lo))
 
 
-def _quat_to_mat(q: tuple[float, float, float, float]) -> np.ndarray:
-    w, x, y, z = q
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
+@dataclass(frozen=True)
+class SphereFov:
+    """Per-lens reach and blend ring (degrees from each lens's own optical axis)."""
+
+    fov_rear: float
+    fov_front: float
+    rear_inner: float
+    rear_outer: float
+    front_inner: float
+    front_outer: float
+
+    @property
+    def overlap_deg(self) -> float:
+        return self.fov_rear + self.fov_front - 180.0
+
+
+def sphere_fov_for_pair(rear: LensParams, front: LensParams) -> SphereFov:
+    """
+    Sphere sized to the rear lens FOV; the front lens overlaps into it.
+
+    Rear is used up to its own image-circle edge and fades out only in a thin
+    ring at that edge. Front stays at full weight through the overlap and only
+    fades at its own rim, so the front covers the rear's edge instead of both
+    being clipped to a common angle.
+    """
+    fr = float(max(90.0, min(lens_max_fov_deg(rear) - _FOV_EDGE_MARGIN_DEG, 120.0)))
+    ff = float(max(90.0, min(lens_max_fov_deg(front) - _FOV_EDGE_MARGIN_DEG, 120.0)))
+    rear_outer = fr
+    rear_inner = max(80.0, fr - _BLEND_RING_DEG)
+    front_outer = ff
+    front_inner = max(80.0, ff - 0.5)
+    return SphereFov(fr, ff, rear_inner, rear_outer, front_inner, front_outer)
+
+_EQ_TO_DJI = EQ_TO_DJI
+_quat_to_mat = quat_to_matrix
 
 
 def _osvplat_world_to_cam(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
@@ -125,10 +185,16 @@ def _kannala_brandt_project(
     return u.astype(np.float32), v.astype(np.float32), valid, theta
 
 
-def _angular_weight(theta: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """1 inside BLEND_INNER, ramp to 0 by BLEND_OUTER (degrees)."""
-    inner = BLEND_INNER_DEG * np.pi / 180.0
-    outer = BLEND_OUTER_DEG * np.pi / 180.0
+def _angular_weight(
+    theta: np.ndarray,
+    valid: np.ndarray,
+    *,
+    blend_inner_deg: float = BLEND_INNER_DEG,
+    blend_outer_deg: float = BLEND_OUTER_DEG,
+) -> np.ndarray:
+    """1 inside blend_inner, ramp to 0 by blend_outer (degrees)."""
+    inner = float(blend_inner_deg) * np.pi / 180.0
+    outer = float(blend_outer_deg) * np.pi / 180.0
     span = max(outer - inner, 1e-6)
     w = np.clip((outer - theta) / span, 0.0, 1.0)
     return np.where(valid, w, 0.0).astype(np.float32)
@@ -140,12 +206,19 @@ def build_lens_maps(
     out_h: int,
     *,
     ref_lens: LensParams | None = None,
+    fov_deg: float | None = None,
+    blend_inner_deg: float | None = None,
+    blend_outer_deg: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Build xmap, ymap (float32) and angular weight for equirect out_w x out_h.
 
     ref_lens: when set (front lens), place this lens as Q_lens Q_refᵀ M_ref (Osmo).
+    fov_deg / blend_*: sphere size so both lens edges meet (see sphere_fov_for_pair).
     """
+    fov = float(LENS_FOV_DEG if fov_deg is None else fov_deg)
+    bi = float(BLEND_INNER_DEG if blend_inner_deg is None else blend_inner_deg)
+    bo = float(BLEND_OUTER_DEG if blend_outer_deg is None else blend_outer_deg)
     ys, xs = np.meshgrid(
         np.linspace(0.5, out_h - 0.5, out_h, dtype=np.float64),
         np.linspace(0.5, out_w - 0.5, out_w, dtype=np.float64),
@@ -170,8 +243,8 @@ def build_lens_maps(
     yl = R_w2c[1, 0] * dx + R_w2c[1, 1] * dy + R_w2c[1, 2] * dz
     zl = R_w2c[2, 0] * dx + R_w2c[2, 1] * dy + R_w2c[2, 2] * dz
 
-    u, v, valid, theta = _kannala_brandt_project(xl, yl, zl, lens)
-    weight = _angular_weight(theta, valid)
+    u, v, valid, theta = _kannala_brandt_project(xl, yl, zl, lens, fov_deg=fov)
+    weight = _angular_weight(theta, valid, blend_inner_deg=bi, blend_outer_deg=bo)
     return u, v, weight
 
 

@@ -44,14 +44,16 @@ def _quat_from_node(node: ProtoNode | None) -> tuple[float, float, float, float]
         x = _float_field(node, 2, 0.0)
         y = _float_field(node, 3, 0.0)
         z = _float_field(node, 4, 0.0)
-        n = math.sqrt(w * w + x * x + y * y + z * z) or 1.0
-        return (w / n, x / n, y / n, z / n)
-    vals = floats_from_node(node)
-    if len(vals) >= 4:
+    else:
+        vals = floats_from_node(node)
+        if len(vals) < 4:
+            return (1.0, 0.0, 0.0, 0.0)
         w, x, y, z = vals[:4]
-        n = math.sqrt(w * w + x * x + y * y + z * z) or 1.0
-        return (w / n, x / n, y / n, z / n)
-    return (1.0, 0.0, 0.0, 0.0)
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    # Avata 360 leaves field 21 as zero bytes; a null quaternion is "absent".
+    if n < 1e-6:
+        return (1.0, 0.0, 0.0, 0.0)
+    return (w / n, x / n, y / n, z / n)
 
 
 def _parse_dewarp_slot(slot: ProtoNode) -> LensParams | None:
@@ -90,26 +92,56 @@ def _parse_dewarp_slot(slot: ProtoNode) -> LensParams | None:
     )
 
 
-def parse_camd_calibration(path: Path) -> Calibration:
-    camd = mp4.find_box(path, "camd")
-    cal = Calibration()
-    if camd is None:
-        log.warning("No camd box in %s", path.name)
-        return cal
+_CAMD_READ_MAX = 512 * 1024
 
-    # camd is itself an MP4; read its mdat
-    inner_mdat = None
-    for box in mp4.iter_boxes(path, start=camd.data_offset, end=camd.end):
-        if box.type == "mdat":
-            inner_mdat = box
+
+def _embedded_mdat_payload(blob: bytes) -> bytes:
+    """camd payload is a tiny MP4 (ftyp/free/mdat); return the mdat body or blob as-is."""
+    pos = 0
+    while pos + 8 <= len(blob):
+        size, kind = struct.unpack(">I4s", blob[pos : pos + 8])
+        header = 8
+        if size == 1 and pos + 16 <= len(blob):
+            size = struct.unpack(">Q", blob[pos + 8 : pos + 16])[0]
+            header = 16
+        if kind == b"mdat":
+            return blob[pos + header :]
+        if size < header:
             break
-    if inner_mdat is None:
-        # sometimes camd payload starts directly with length-delimited protobuf
-        data = mp4.read_bytes(path, camd.data_offset, min(camd.size - camd.header_size, 512 * 1024))
-    else:
-        data = mp4.read_bytes(
-            path, inner_mdat.data_offset, min(inner_mdat.size - inner_mdat.header_size, 512 * 1024)
-        )
+        pos += size
+    return blob
+
+
+def _camd_payload(path: Path) -> bytes | None:
+    """
+    Osmo 360: top-level ``camd`` box. Avata 360: ``CAM camd`` meta track whose
+    first sample starts with the same embedded MP4.
+    """
+    camd = mp4.find_box(path, "camd")
+    if camd is not None:
+        blob = mp4.read_bytes(path, camd.data_offset, min(camd.size - camd.header_size, _CAMD_READ_MAX))
+        return _embedded_mdat_payload(blob)
+    moov = mp4.find_box(path, "moov")
+    if moov is None:
+        return None
+    for trak in mp4.iter_boxes(path, start=moov.data_offset, end=moov.end):
+        if trak.type != "trak" or "camd" not in mp4.track_name(path, trak).lower():
+            continue
+        table = mp4.load_sample_table(path, trak)
+        offsets = mp4.expand_sample_offsets(table) if table is not None else []
+        if not offsets:
+            continue
+        off, size = offsets[0]
+        return _embedded_mdat_payload(mp4.read_bytes(path, off, min(size, _CAMD_READ_MAX)))
+    return None
+
+
+def parse_camd_calibration(path: Path) -> Calibration:
+    cal = Calibration()
+    data = _camd_payload(path)
+    if data is None:
+        log.warning("No camd box/track in %s", path.name)
+        return cal
 
     nodes = parse_protobuf(data)
     # Records: 1 header, 2 config, 3 per-frame...

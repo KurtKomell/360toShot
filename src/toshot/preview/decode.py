@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 import threading
@@ -15,28 +14,6 @@ from toshot.source.models import Capture
 
 log = logging.getLogger(__name__)
 
-# #region agent log
-_DBG = Path(r"d:\360toShot\.cursor\debug-06c6a9.log")
-
-
-def _dbg(hypothesis_id: str, location: str, message: str, data: dict | None = None, run_id: str = "fps") -> None:
-    try:
-        payload = {
-            "sessionId": "06c6a9",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        with _DBG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
-# #endregion
 
 
 @dataclass
@@ -138,20 +115,6 @@ class DualLensDecoder:
             cap_fps,
             probed,
         )
-        # #region agent log
-        _dbg(
-            "P",
-            "decode.py:init",
-            "preview fps select",
-            {
-                "path": self.path.name,
-                "kind": self.kind,
-                "cap_fps": cap_fps,
-                "probe_fps": probed,
-                "use_fps": self.fps,
-            },
-        )
-        # #endregion
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="toshot-preview-decode", daemon=True)
@@ -235,8 +198,6 @@ class DualLensDecoder:
         assert pr.stdout and pf.stdout
         frame_dt = 1.0 / self.fps if self.fps > 0 else (1.0 / 30.0)
         next_t = time.perf_counter()
-        pace_log_t = next_t
-        pace_frames = 0
         try:
             while not self._stop.is_set():
                 while self._pause.is_set() and not self._stop.is_set():
@@ -260,7 +221,6 @@ class DualLensDecoder:
                 with self._lock:
                     self._frame = PreviewFrame(rear=rear, front=front, t_s=t, index=self._index)
                 self._index += 1
-                pace_frames += 1
                 # Pace to source fps — without this, decode runs as fast as GPU/CPU allow.
                 next_t += frame_dt
                 delay = next_t - time.perf_counter()
@@ -269,24 +229,6 @@ class DualLensDecoder:
                 elif delay < -0.25:
                     # Fell far behind (startup decode burst): resync clock
                     next_t = time.perf_counter()
-                now = time.perf_counter()
-                if now - pace_log_t >= 1.0:
-                    # #region agent log
-                    _dbg(
-                        "P",
-                        "decode.py:pace",
-                        "decode pacing",
-                        {
-                            "target_fps": self.fps,
-                            "measured_fps": pace_frames / max(now - pace_log_t, 1e-6),
-                            "index": self._index,
-                            "behind_s": max(0.0, -delay),
-                        },
-                        run_id="post-fix",
-                    )
-                    # #endregion
-                    pace_log_t = now
-                    pace_frames = 0
         finally:
             pr.kill()
             pf.kill()

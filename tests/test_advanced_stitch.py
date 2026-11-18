@@ -44,8 +44,9 @@ def test_selfie_prefers_brighter_nadir():
     a = np.full((h, w), 0.5, dtype=np.float32)
     b = np.full((h, w), 0.5, dtype=np.float32)
     aa, bb = selfie_stick_weights(rear, front, a, b, nadir_fraction=0.15)
-    # Near stick, rear weight should increase
-    assert aa[-5, w // 2] > bb[-5, w // 2]
+    # Nadir is hard single-lens (no soft mix); stick on front → prefer rear
+    assert aa[-5, w // 2] >= bb[-5, w // 2]
+    assert float(aa[-5:].mean()) >= 0.99 or float(bb[-5:].mean()) >= 0.99
 
 
 def test_optical_flow_returns_aligned():

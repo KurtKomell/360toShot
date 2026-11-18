@@ -110,20 +110,22 @@ def selfie_stick_weights(
 
     aa = a[band]
     bb = b[band]
-    aa = np.where(prefer_rear, aa + strength * (1.0 - aa), aa)
-    bb = np.where(prefer_rear, 1.0 - aa, bb)
-    bb = np.where(prefer_front, bb + strength * (1.0 - bb), bb)
-    aa = np.where(prefer_front, 1.0 - bb, aa)
-    # Also fade both near pure nadir if both look like sticks
-    both = (sr > 0.55) & (sf > 0.55)
-    fade = both.astype(np.float32) * 0.35
-    # Keep geometry; just soften conflict — no need to zero both
+    # Hard pick per pixel — no soft mix at nadir (avoids ghosting on tripod/stick)
+    aa = np.where(prefer_rear, 1.0, aa)
+    bb = np.where(prefer_rear, 0.0, bb)
+    bb = np.where(prefer_front, 1.0, bb)
+    aa = np.where(prefer_front, 0.0, aa)
+    # Whole nadir disk: one lens only (seam through the pole splits close subjects)
+    if float(aa.mean()) >= float(bb.mean()):
+        aa[:] = 1.0
+        bb[:] = 0.0
+    else:
+        aa[:] = 0.0
+        bb[:] = 1.0
+    _ = strength
     a[band] = aa
     b[band] = bb
-    _ = fade  # reserved for future inpaint
-    s = a + b
-    s = np.where(s > 1e-6, s, 1.0)
-    return (a / s).astype(np.float32), (b / s).astype(np.float32)
+    return a.astype(np.float32), b.astype(np.float32)
 
 
 def _seam_path(cost: np.ndarray) -> np.ndarray:
@@ -153,6 +155,86 @@ def _seam_path(cost: np.ndarray) -> np.ndarray:
     return path
 
 
+def hard_cut_at_lens_meet(
+    rear: np.ndarray,
+    front: np.ndarray,
+    weight_a: np.ndarray,
+    weight_b: np.ndarray,
+    *,
+    scale: float = 0.25,
+    seam_blend_px: int = 0,
+    seam_expand_px: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find where the two lens FOVs meet, join there, cut the rest.
+
+    weight_a/b encode angular distance from each optical axis (from camd FOV).
+    The meet column is where rear≈front preference in the overlap ring. Everything
+    left of that cut keeps only rear; right keeps only front — no overlapping video.
+    """
+    _ = (scale, seam_blend_px, seam_expand_px, rear, front)  # API compat / no warp
+    h, w = weight_a.shape
+    # Geometric meet: prefer the lens closer to its optical axis
+    hard_a = (weight_a >= weight_b).astype(np.float32)
+
+    overlap = (weight_a > 0.08) & (weight_b > 0.08)
+    bands: list[tuple[int, int]] = []
+    if np.any(overlap):
+        mid = overlap[h // 4 : (3 * h) // 4]
+        col_hits = mid.sum(axis=0)
+        bands = _overlap_column_bands(col_hits > max(2, mid.shape[0] // 20))
+        # Mid-latitude row: column where |a-b| is smallest = FOV meet angle
+        y_mid = h // 2
+        for x_min, x_max in bands:
+            if x_max <= x_min:
+                continue
+            diff = np.abs(weight_a[y_mid, x_min : x_max + 1] - weight_b[y_mid, x_min : x_max + 1])
+            mid_col = (x_min + x_max) // 2
+            rear_on_left = float(weight_a[y_mid, x_min : mid_col + 1].mean()) >= float(
+                weight_a[y_mid, mid_col : x_max + 1].mean()
+            )
+            # Both lenses at full weight ⇒ |a−b| ties over a plateau; take the
+            # rear-side end so the front covers the whole overlap at both seams.
+            tie = np.flatnonzero(diff <= float(diff.min()) + 1e-4)
+            meet = int(x_min + int(tie[0] if rear_on_left else tie[-1]))
+            xs = np.arange(w)
+            # Cut at meet for all rows: discard the other lens past this angle
+            if rear_on_left:
+                # rear owns (-inf, meet], front owns (meet, +inf) — but only
+                # rewrite inside a generous strip around this seam so the other
+                # seam stays independent
+                pad = max(32, (x_max - x_min) * 3)
+                x0 = max(0, meet - pad)
+                x1 = min(w - 1, meet + pad)
+                strip = (xs >= x0) & (xs <= x1)
+                row = (xs <= meet).astype(np.float32)
+            else:
+                pad = max(32, (x_max - x_min) * 3)
+                x0 = max(0, meet - pad)
+                x1 = min(w - 1, meet + pad)
+                strip = (xs >= x0) & (xs <= x1)
+                row = (xs >= meet).astype(np.float32)
+            hard_a = np.where(strip[None, :], row[None, :], hard_a)
+
+    # Nadir / zenith: both lenses see the pole with large parallax (tripod/stick).
+    # A ±90° longitude cut through the pole splits the subject — give the whole
+    # disk to one lens (DJI-style "single lens nadir").
+    nadir_frac = 0.20
+    zenith_frac = 0.12
+    y_n = int(h * (1.0 - nadir_frac))
+    y_z = max(1, int(h * zenith_frac))
+    nadir_rear = float(weight_a[y_n:, :].sum()) >= float(weight_b[y_n:, :].sum())
+    zenith_rear = float(weight_a[:y_z, :].sum()) >= float(weight_b[:y_z, :].sum())
+    hard_a[y_n:, :] = 1.0 if nadir_rear else 0.0
+    hard_a[:y_z, :] = 1.0 if zenith_rear else 0.0
+
+    hard_a = (hard_a >= 0.5).astype(np.float32)
+    hard_b = (1.0 - hard_a).astype(np.float32)
+
+
+    return front, hard_a, hard_b
+
+
 def optical_flow_align_and_seam(
     rear: np.ndarray,
     front: np.ndarray,
@@ -160,89 +242,19 @@ def optical_flow_align_and_seam(
     weight_b: np.ndarray,
     *,
     scale: float = 0.25,
-    seam_blend_px: int = 8,
+    seam_blend_px: int = 0,
+    seam_expand_px: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Align front→rear with DIS optical flow in the overlap, then carve a soft seam.
-    Returns (aligned_front, weight_a, weight_b).
-    """
-    overlap = (weight_a > 0.08) & (weight_b > 0.08)
-    if not np.any(overlap):
-        return front, weight_a, weight_b
-
-    h, w = rear.shape[:2]
-    sc = max(0.1, min(1.0, scale))
-    sw, sh = max(16, int(w * sc)), max(8, int(h * sc))
-
-    r_s = cv2.resize(rear, (sw, sh), interpolation=cv2.INTER_AREA)
-    f_s = cv2.resize(front, (sw, sh), interpolation=cv2.INTER_AREA)
-    o_s = cv2.resize(overlap.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST) > 0
-
-    gray_r = cv2.cvtColor(r_s, cv2.COLOR_BGR2GRAY)
-    gray_f = cv2.cvtColor(f_s, cv2.COLOR_BGR2GRAY)
-
-    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
-    flow = dis.calc(gray_f, gray_r, None)  # front → rear
-    # Zero flow outside overlap (avoid wild warps)
-    flow = flow.copy()
-    flow[~o_s] = 0
-    flow = cv2.GaussianBlur(flow, (0, 0), 1.5)
-
-    # Upscale flow to full resolution
-    flow_full = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
-    flow_full *= (1.0 / sc)
-    map_x, map_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    map_x = map_x + flow_full[..., 0]
-    map_y = np.clip(map_y + flow_full[..., 1], 0, h - 1)
-    map_x %= w
-    aligned = cv2.remap(front, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-
-    # Seam cost on luminance difference in overlap
-    gr = cv2.cvtColor(rear, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    gf = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    diff = np.abs(gr - gf)
-    diff = np.where(overlap, diff, 1e6)
-
-    ys, xs = np.where(overlap)
-    if len(ys) == 0:
-        return aligned, weight_a, weight_b
-
-    y_min, y_max = int(ys.min()), int(ys.max())
-    # Osmo has two thin seams (~90° apart). Ignore polar rows — both lenses often
-    # overlap there in every column, which would merge the two seams into one band.
-    mid = overlap[h // 4 : (3 * h) // 4]
-    col_hits = mid.sum(axis=0)
-    bands = _overlap_column_bands(col_hits > max(2, mid.shape[0] // 20))
-    if not bands:
-        return aligned, weight_a, weight_b
-
-    new_a = weight_a.copy()
-    half = max(1, seam_blend_px)
-    for x_min, x_max in bands:
-        if x_max - x_min < 2:
-            continue
-        band = diff[y_min : y_max + 1, x_min : x_max + 1].copy()
-        ov_band = overlap[y_min : y_max + 1, x_min : x_max + 1]
-        band = np.where(ov_band, band, float(band[ov_band].max()) + 1000.0 if ov_band.any() else 1e6)
-        path = _seam_path(band)
-        # Keep the side that originally preferred rear (a) on that side of the cut
-        left_pref = float(weight_a[y_min : y_max + 1, x_min : x_min + max(1, (x_max - x_min) // 3)].mean())
-        right_pref = float(weight_a[y_min : y_max + 1, x_max - max(1, (x_max - x_min) // 3) : x_max + 1].mean())
-        rear_on_left = left_pref >= right_pref
-        for i, y in enumerate(range(y_min, y_max + 1)):
-            cut = x_min + int(path[i])
-            xs_row = np.arange(w, dtype=np.float32)
-            t = (xs_row - (cut - half)) / max(2 * half, 1)
-            t = np.clip(t, 0.0, 1.0)
-            t = t * t * (3 - 2 * t)
-            row_a = (1.0 - t) if rear_on_left else t
-            new_a[y] = np.where(overlap[y], row_a, new_a[y])
-
-    new_b = np.where(overlap, 1.0 - new_a, weight_b)
-    new_a = np.where(overlap, new_a, weight_a)
-    s = new_a + new_b
-    s = np.where(s > 1e-6, s, 1.0)
-    return aligned, (new_a / s).astype(np.float32), (new_b / s).astype(np.float32)
+    """API alias: geometric meet-angle hard cut (no overlap blend, no warp)."""
+    return hard_cut_at_lens_meet(
+        rear,
+        front,
+        weight_a,
+        weight_b,
+        scale=scale,
+        seam_blend_px=seam_blend_px,
+        seam_expand_px=seam_expand_px,
+    )
 
 
 def _overlap_column_bands(cols: np.ndarray) -> list[tuple[int, int]]:
@@ -286,6 +298,7 @@ def blend_advanced(
             b,
             scale=options.flow_scale,
             seam_blend_px=options.seam_blend_px,
+            seam_expand_px=getattr(options, "seam_expand_px", 96),
         )
 
     if options.selfie_mask:
@@ -296,6 +309,11 @@ def blend_advanced(
             b,
             nadir_fraction=options.selfie_nadir_fraction,
         )
+
+    if options.seam_blend_px > 0:
+        k = int(options.seam_blend_px)
+        a = cv2.blur(a.astype(np.float32), (k, k), borderType=cv2.BORDER_REPLICATE)
+        b = (1.0 - a).astype(np.float32)
 
     blended = (
         rear.astype(np.float32) * a[..., None] + fr.astype(np.float32) * b[..., None]

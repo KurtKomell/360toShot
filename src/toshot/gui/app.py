@@ -321,6 +321,13 @@ class ToshotApp(ctk.CTk):
         ).pack(fill="x", padx=18, pady=(16, 6))
         ctk.CTkButton(
             parent,
+            text="Beide Linsen roh (ohne Stitch)",
+            fg_color=COLORS["panel2"],
+            hover_color=COLORS["line"],
+            command=self._open_raw_lenses,
+        ).pack(fill="x", padx=18, pady=(0, 6))
+        ctk.CTkButton(
+            parent,
             text="Captures im Ordner listen",
             fg_color=COLORS["panel2"],
             hover_color=COLORS["line"],
@@ -444,18 +451,36 @@ class ToshotApp(ctk.CTk):
         if path:
             self._output.set(path)
 
-    def _open_preview(self) -> None:
-        """Launch Vulkan live stitch in a separate process (GLFW needs own loop)."""
+    def _preview_source(self) -> Path | None:
         src = self._input.get().strip()
         if not src:
             messagebox.showinfo("toshot", "Bitte eine Capture-Datei wählen (nicht nur Ordner).")
-            return
+            return None
         path = resolve_path(src)
         if path.is_dir():
             messagebox.showinfo(
                 "toshot",
                 "Vorschau braucht eine einzelne .OSV/.insv-Datei.",
             )
+            return None
+        return path
+
+    def _spawn_preview(self, cmd: list[str], status: str) -> None:
+        self._status.set(status)
+        try:
+            import os
+
+            env = os.environ.copy()
+            src_root = str(Path(__file__).resolve().parents[2])  # .../src
+            env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
+            subprocess.Popen(cmd, env=env)
+        except Exception as exc:
+            messagebox.showerror("toshot", f"Vorschau fehlgeschlagen:\n{exc}")
+
+    def _open_preview(self) -> None:
+        """Launch Vulkan live stitch in a separate process (GLFW needs own loop)."""
+        path = self._preview_source()
+        if path is None:
             return
         stab = self._stab.get() or "world"
         cmd = [
@@ -481,16 +506,23 @@ class ToshotApp(ctk.CTk):
             f"▶ Vulkan-Vorschau  {path.name}  stab={stab}  stitch={mode} "
             f"(flow={self._optical.get()} selfie={self._selfie.get()} rs={self._rs.get()})"
         )
-        self._status.set("Vorschau gestartet…")
-        try:
-            import os
+        self._spawn_preview(cmd, "Vorschau gestartet…")
 
-            env = os.environ.copy()
-            src_root = str(Path(__file__).resolve().parents[2])  # .../src
-            env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
-            subprocess.Popen(cmd, env=env)
-        except Exception as exc:
-            messagebox.showerror("toshot", f"Vorschau fehlgeschlagen:\n{exc}")
+    def _open_raw_lenses(self) -> None:
+        """Show rear|front fisheye without any stitching."""
+        path = self._preview_source()
+        if path is None:
+            return
+        cmd = [
+            sys.executable,
+            "-m",
+            "toshot.preview",
+            str(path),
+            "--raw-lenses",
+            "-v",
+        ]
+        self._append_log(f"▶ Roh-Linsen (ohne Stitch)  {path.name}")
+        self._spawn_preview(cmd, "Roh-Linsen gestartet…")
 
     def _stitch_opts(self) -> StitchOptions:
         return StitchOptions.from_flags(
