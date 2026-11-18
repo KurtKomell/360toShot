@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toshot"
+version = "0.1.0"
+description = "Headless 360 capture to equirect and AI-tracked shot export for DJI OSV/LRF and Insta360 INSV/LRV"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "360toShot" }]
+dependencies = [
+  "numpy>=1.26",
+  "opencv-python-headless>=4.8",
+  "ultralytics>=8.3",
+  "lap>=0.5.12",
+  "customtkinter>=5.2",
+  "wgpu>=0.33",
+  "rendercanvas>=2.0",
+  "glfw>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+toshot = "toshot.cli:main"
+toshot-gui = "toshot.gui.app:run_gui"
+toshot-preview = "toshot.preview.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+toshot = ["py.typed"]
