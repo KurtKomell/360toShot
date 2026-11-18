@@ -154,6 +154,17 @@ def quat_to_matrix(q: Sequence[float]) -> np.ndarray:
     )
 
 
+def rotvec_to_matrix(v_deg: Sequence[float]) -> np.ndarray:
+    """Rodrigues: rotation vector (degrees) → 3×3."""
+    v = np.radians(np.asarray(v_deg, dtype=np.float64))
+    ang = float(np.linalg.norm(v))
+    if ang < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    k = v / ang
+    kx = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + math.sin(ang) * kx + (1.0 - math.cos(ang)) * (kx @ kx)
+
+
 def world_to_stitch_matrix(q: Sequence[float]) -> np.ndarray:
     """World direction (equirect axes, y up) → direction in the stitched lens-frame equirect."""
     return EQ_TO_DJI.T @ quat_to_matrix(q).T @ EQ_TO_DJI
@@ -202,6 +213,16 @@ class AttitudeTrack:
         med = np.median(g, axis=0)
         i = lo + int(np.argmax(g @ med))
         return tuple(self.q[i])  # type: ignore[return-value]
+
+
+def lens_axes_vertical(samples: Sequence[AttitudeSample]) -> bool:
+    """True when gravity runs along the lens axes (lenses look up/down, e.g. Avata 360)."""
+    if not samples:
+        return False
+    step = max(1, len(samples) // 2000)
+    track = AttitudeTrack(samples[::step])
+    down = np.median(track.down_stitch, axis=0)
+    return bool(abs(down[2]) > 0.7)
 
 
 def _heading_axis(c0: np.ndarray) -> np.ndarray:

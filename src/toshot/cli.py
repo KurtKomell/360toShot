@@ -98,7 +98,7 @@ def _add_encode_flags(p: argparse.ArgumentParser) -> None:
         "--bitrate",
         type=_bitrate_arg,
         default=None,
-        help="Ziel-Bitrate statt CRF, z.B. 80 oder 80M oder 12000k",
+        help="Ziel-Bitrate statt CRF in kbit/s, z.B. 80000 oder 80M",
     )
     p.add_argument(
         "--preset",
@@ -115,8 +115,8 @@ def _add_encode_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--audio-bitrate",
         type=_audio_bitrate_arg,
-        default="192k",
-        help="Audio-Bitrate, z.B. 192 oder 256k",
+        default="320k",
+        help="Audio-Bitrate, z.B. 320 oder 256k",
     )
 
 

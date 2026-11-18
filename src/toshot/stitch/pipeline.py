@@ -4,6 +4,7 @@ import logging
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -16,7 +17,7 @@ from toshot.ffmpeg_bin import (
     choose_video_encoder,
     ffmpeg_path,
 )
-from toshot.math3d import stabilization_matrices
+from toshot.math3d import lens_axes_vertical, stabilization_matrices
 from toshot.parallel import stitch_workers
 from toshot.source.models import AttitudeSample, Capture, LensLayout, LensParams, StabMode
 from toshot.stitch.advanced import blend_advanced
@@ -33,15 +34,28 @@ log = logging.getLogger(__name__)
 
 
 def _build_pair_maps(
-    rear_s: LensParams, front_s: LensParams, out_w: int, out_h: int
+    rear_s: LensParams,
+    front_s: LensParams,
+    out_w: int,
+    out_h: int,
+    *,
+    rear_on_top: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    sf = sphere_fov_for_pair(rear_s, front_s)
-    log.info(
-        "Kugel = Rear-FOV %.2f°, Front %.2f° überlappt (%.1f°)",
-        sf.fov_rear,
-        sf.fov_front,
-        sf.overlap_deg,
-    )
+    sf = sphere_fov_for_pair(rear_s, front_s, rear_on_top=rear_on_top)
+    if rear_on_top:
+        log.info(
+            "Kugel = Front-FOV %.2f°, Rear %.2f° (Überlapp %.1f°)",
+            sf.fov_front,
+            sf.fov_rear,
+            sf.overlap_deg,
+        )
+    else:
+        log.info(
+            "Kugel = Rear-FOV %.2f°, Front %.2f° überlappt (%.1f°)",
+            sf.fov_rear,
+            sf.fov_front,
+            sf.overlap_deg,
+        )
     x0, y0, w0 = build_lens_maps(
         rear_s,
         out_w,
@@ -81,18 +95,14 @@ def _write_weight_png(path: Path, weight: np.ndarray) -> None:
 def _scale_lens(lens: LensParams, src_w: int, src_h: int) -> LensParams:
     sx = src_w / max(lens.width, 1)
     sy = src_h / max(lens.height, 1)
-    return LensParams(
+    return replace(
+        lens,
         fx=lens.fx * sx,
         fy=lens.fy * sy,
         cx=lens.cx * sx,
         cy=lens.cy * sy,
-        k=lens.k,
         width=src_w,
         height=src_h,
-        extrinsic_q=lens.extrinsic_q,
-        yaw_deg=lens.yaw_deg,
-        pitch_deg=lens.pitch_deg,
-        roll_deg=lens.roll_deg,
     )
 
 
@@ -140,7 +150,13 @@ def prepare_maps(
     rear_s = _scale_lens(rear, src_w, src_h)
     front_s = _scale_lens(front, src_w, src_h)
 
-    x0, y0, w0, x1, y1, w1 = _build_pair_maps(rear_s, front_s, out_w, out_h)
+    x0, y0, w0, x1, y1, w1 = _build_pair_maps(
+        rear_s,
+        front_s,
+        out_w,
+        out_h,
+        rear_on_top=lens_axes_vertical(capture.attitude or []),
+    )
     a, _b = blend_weights(w0, w1, feather_px=feather_px_for(out_w))
 
     x0p, y0p = work / "rear_x.pgm", work / "rear_y.pgm"
@@ -186,6 +202,12 @@ def stitch_equirect(
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     opts = options or StitchOptions()
+    if lens_axes_vertical(capture.attitude or []):
+        # Same as preview: Euler RS rates are unusable near pitch≈90° (Avata).
+        opts = replace(opts, vertical_lenses=True, rolling_shutter=False)
+        log.info(
+            "Linsen schauen oben/unten (Gyro) → Naht am Horizont, Rolling-Shutter aus"
+        )
     src = Path(source) if source else capture.render_source()
     # Hard rule: never decode LRF/LRV — always fall back to OSV/INSV master
     if src.suffix.lower() in {".lrf", ".lrv"} or src.name.upper().startswith("LRV_"):
@@ -347,7 +369,9 @@ def _opencv_stitch(
     )
     rear_s = _scale_lens(rear, src_w, src_h)
     front_s = _scale_lens(front, src_w, src_h)
-    x0, y0, w0, x1, y1, w1 = _build_pair_maps(rear_s, front_s, out_w, out_h)
+    x0, y0, w0, x1, y1, w1 = _build_pair_maps(
+        rear_s, front_s, out_w, out_h, rear_on_top=options.vertical_lenses
+    )
     a, b = blend_weights(w0, w1, feather_px=feather_px_for(out_w))
     times = [i / fps if fps > 0 else 0.0 for i in range(n_frames)]
     rotations = stabilization_matrices(capture.attitude or [], times, stab)
@@ -392,10 +416,15 @@ def _opencv_stitch(
         "+faststart",
         str(output),
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     assert proc.stdin is not None
     # Keep a sliding window of in-flight frames so RAM stays bounded
     window = max(workers * 2, workers)
+    err_tail = ""
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             pending: dict[int, object] = {}
@@ -443,14 +472,32 @@ def _opencv_stitch(
                 blended = fut.result()  # type: ignore[union-attr]
                 if next_write == 0 or (next_write + 1) % 30 == 0 or (next_write + 1) == n_frames:
                     log.info("Stitch frame %d / %d", next_write + 1, n_frames)
-                proc.stdin.write(blended.tobytes())
+                try:
+                    proc.stdin.write(blended.tobytes())
+                except (BrokenPipeError, OSError) as exc:
+                    err_tail = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-2000:]
+                    raise RuntimeError(
+                        f"OpenCV stitch encode aborted while writing frame {next_write + 1}: {exc}"
+                        + (f"\nFFmpeg: {err_tail.strip()}" if err_tail.strip() else "")
+                    ) from exc
                 next_write += 1
                 more = _submit_until_full() or more
     finally:
-        proc.stdin.close()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        if not err_tail and proc.stderr is not None:
+            err_tail = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-2000:]
         proc.wait()
         if proc.returncode:
-            raise RuntimeError(f"OpenCV stitch encode failed ({proc.returncode})")
+            try:
+                if output.exists():
+                    output.unlink()
+            except OSError:
+                pass
+            detail = err_tail.strip() or f"exit {proc.returncode}"
+            raise RuntimeError(f"OpenCV stitch encode failed ({detail})")
     return output
 
 

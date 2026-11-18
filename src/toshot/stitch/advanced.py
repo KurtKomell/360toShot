@@ -110,18 +110,12 @@ def selfie_stick_weights(
 
     aa = a[band]
     bb = b[band]
-    # Hard pick per pixel — no soft mix at nadir (avoids ghosting on tripod/stick)
+    # Hard pick per pixel where stick scores disagree. Do not force the whole
+    # nadir disk to one lens — that kept Osmo Front housing in BL/BR.
     aa = np.where(prefer_rear, 1.0, aa)
     bb = np.where(prefer_rear, 0.0, bb)
     bb = np.where(prefer_front, 1.0, bb)
     aa = np.where(prefer_front, 0.0, aa)
-    # Whole nadir disk: one lens only (seam through the pole splits close subjects)
-    if float(aa.mean()) >= float(bb.mean()):
-        aa[:] = 1.0
-        bb[:] = 0.0
-    else:
-        aa[:] = 0.0
-        bb[:] = 1.0
     _ = strength
     a[band] = aa
     b[band] = bb
@@ -164,6 +158,7 @@ def hard_cut_at_lens_meet(
     scale: float = 0.25,
     seam_blend_px: int = 0,
     seam_expand_px: int = 0,
+    vertical_lenses: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Find where the two lens FOVs meet, join there, cut the rest.
@@ -193,10 +188,26 @@ def hard_cut_at_lens_meet(
             rear_on_left = float(weight_a[y_mid, x_min : mid_col + 1].mean()) >= float(
                 weight_a[y_mid, mid_col : x_max + 1].mean()
             )
-            # Both lenses at full weight ⇒ |a−b| ties over a plateau; take the
-            # rear-side end so the front covers the whole overlap at both seams.
+            # Both lenses at full weight ⇒ |a−b| ties over a plateau.
+            # Osmo: rear-side end → front covers the whole overlap.
+            # Avata: front covers most of the plateau (per-side bias).
             tie = np.flatnonzero(diff <= float(diff.min()) + 1e-4)
-            meet = int(x_min + int(tie[0] if rear_on_left else tie[-1]))
+            if vertical_lenses:
+                bias = 0.38 if mid_col < w // 2 else 0.28
+                extra_px = 0
+                n_tie = len(tie) - 1
+                if rear_on_left:
+                    i = int(np.clip(round(n_tie * bias), 0, n_tie))
+                    meet = int(x_min + int(tie[i]))
+                    if extra_px:
+                        meet = min(int(x_max), meet + extra_px)
+                else:
+                    i = int(np.clip(round(n_tie * (1.0 - bias)), 0, n_tie))
+                    meet = int(x_min + int(tie[i]))
+                    if extra_px:
+                        meet = max(int(x_min), meet - extra_px)
+            else:
+                meet = int(x_min + int(tie[0] if rear_on_left else tie[-1]))
             xs = np.arange(w)
             # Cut at meet for all rows: discard the other lens past this angle
             if rear_on_left:
@@ -216,21 +227,21 @@ def hard_cut_at_lens_meet(
                 row = (xs >= meet).astype(np.float32)
             hard_a = np.where(strip[None, :], row[None, :], hard_a)
 
-    # Nadir / zenith: both lenses see the pole with large parallax (tripod/stick).
-    # A ±90° longitude cut through the pole splits the subject — give the whole
-    # disk to one lens (DJI-style "single lens nadir").
+    # Nadir / zenith: both lenses see the pole with large parallax.
+    # Per-longitude column at both caps — a whole-disk pick exposed Osmo
+    # housing holes at BL/BR and matching zenith gaps.
     nadir_frac = 0.20
     zenith_frac = 0.12
     y_n = int(h * (1.0 - nadir_frac))
     y_z = max(1, int(h * zenith_frac))
-    nadir_rear = float(weight_a[y_n:, :].sum()) >= float(weight_b[y_n:, :].sum())
-    zenith_rear = float(weight_a[:y_z, :].sum()) >= float(weight_b[:y_z, :].sum())
-    hard_a[y_n:, :] = 1.0 if nadir_rear else 0.0
-    hard_a[:y_z, :] = 1.0 if zenith_rear else 0.0
+    if not vertical_lenses:
+        nadir_rear = weight_a[y_n:, :].sum(axis=0) >= weight_b[y_n:, :].sum(axis=0)
+        hard_a[y_n:, :] = nadir_rear.astype(np.float32)[None, :]
+        zenith_rear = weight_a[:y_z, :].sum(axis=0) >= weight_b[:y_z, :].sum(axis=0)
+        hard_a[:y_z, :] = zenith_rear.astype(np.float32)[None, :]
 
     hard_a = (hard_a >= 0.5).astype(np.float32)
     hard_b = (1.0 - hard_a).astype(np.float32)
-
 
     return front, hard_a, hard_b
 
@@ -291,17 +302,18 @@ def blend_advanced(
     fr = front
 
     if options.optical_flow:
-        fr, a, b = optical_flow_align_and_seam(
+        fr, a, b = hard_cut_at_lens_meet(
             rear,
             fr,
             a,
             b,
             scale=options.flow_scale,
             seam_blend_px=options.seam_blend_px,
-            seam_expand_px=getattr(options, "seam_expand_px", 96),
+            seam_expand_px=options.seam_expand_px,
+            vertical_lenses=options.vertical_lenses,
         )
 
-    if options.selfie_mask:
+    if options.selfie_mask and not options.vertical_lenses:
         a, b = selfie_stick_weights(
             rear,
             fr,
@@ -311,16 +323,17 @@ def blend_advanced(
         )
 
     if options.seam_blend_px > 0:
-        k = int(options.seam_blend_px)
-        a = cv2.blur(a.astype(np.float32), (k, k), borderType=cv2.BORDER_REPLICATE)
+        # Osmo-style feather across the vertical meet: soft only in longitude.
+        k = max(3, int(options.seam_blend_px) | 1)
+        a = cv2.blur(a.astype(np.float32), (k, 1), borderType=cv2.BORDER_REPLICATE)
         b = (1.0 - a).astype(np.float32)
 
     blended = (
         rear.astype(np.float32) * a[..., None] + fr.astype(np.float32) * b[..., None]
     ).astype(np.uint8)
 
-    if options.rolling_shutter and attitude:
-        yaw_r, pitch_r, _ = angular_rate_deg(list(attitude), t_s)
+    if options.rolling_shutter and attitude and not options.vertical_lenses:
+        yaw_r, pitch_r, _roll_r = angular_rate_deg(list(attitude), t_s)
         readout = options.rs_readout_fraction / max(fps, 1e-3)
         blended = apply_rolling_shutter(blended, yaw_r, pitch_r, readout_s=readout)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import struct
+from dataclasses import replace
 from pathlib import Path
 
 from toshot import mp4
@@ -93,6 +94,10 @@ def _parse_dewarp_slot(slot: ProtoNode) -> LensParams | None:
 
 
 _CAMD_READ_MAX = 512 * 1024
+# Avata 360: no usable lens quaternion — residual equirect trims (patch match).
+# Front ry more negative pulls lower-lens content left (L dx −3→~0 at −1.7).
+_AVATA_FRONT_TRIM_EQ_DEG = (0.65, -1.7, 0.0)
+_AVATA_REAR_TRIM_EQ_DEG = (0.9, 0.4, 0.2)
 
 
 def _embedded_mdat_payload(blob: bytes) -> bytes:
@@ -188,6 +193,11 @@ def parse_camd_calibration(path: Path) -> Calibration:
         cal.rear = unique[0]
     if len(unique) >= 2:
         cal.front = unique[1]
+    if "avata" in cal.model.lower():
+        if cal.rear is not None:
+            cal.rear = replace(cal.rear, trim_eq_deg=_AVATA_REAR_TRIM_EQ_DEG)
+        if cal.front is not None:
+            cal.front = replace(cal.front, trim_eq_deg=_AVATA_FRONT_TRIM_EQ_DEG)
     return cal
 
 

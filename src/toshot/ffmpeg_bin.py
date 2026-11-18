@@ -156,6 +156,25 @@ def probe(path: Path) -> dict:
     return data
 
 
+def probe_duration(path: Path) -> float:
+    """Fast duration-only probe (no stream dump). Returns seconds or 0."""
+    cmd = [
+        ffprobe_path(),
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    proc = run(cmd, check=False, log_stdout=False, log_stderr=False, quiet=True)
+    try:
+        return max(0.0, float((proc.stdout or "").strip() or 0.0))
+    except ValueError:
+        return 0.0
+
+
 @dataclass(frozen=True)
 class EncoderChoice:
     video: str
@@ -177,7 +196,7 @@ class EncodeSettings:
     crf: int = 18
     bitrate: str | None = None
     preset: str = "medium"
-    audio_bitrate: str = "192k"
+    audio_bitrate: str = "320k"
     bit_depth: int | None = None
 
     def summary(self) -> str:
@@ -189,8 +208,12 @@ class EncodeSettings:
         )
 
 
-def normalize_bitrate(value: str | None, *, default_unit: str = "M") -> str | None:
-    """Accept ``80``, ``80M`` or ``1500k``. A bare number uses ``default_unit`` (M for video)."""
+# NVENC rejects maxrate above ~2.147e9 bit/s (~2147 Mbit/s). Keep headroom.
+_MAX_VIDEO_BITRATE_MBIT = 500.0
+
+
+def normalize_bitrate(value: str | None, *, default_unit: str = "k") -> str | None:
+    """Accept ``80000``, ``80M`` or ``1500k``. A bare number uses ``default_unit`` (k for video)."""
     if value is None:
         return None
     s = "".join(str(value).strip().split()).lower()
@@ -207,13 +230,20 @@ def normalize_bitrate(value: str | None, *, default_unit: str = "M") -> str | No
         raise ValueError(f"Bitrate nicht lesbar: {value}") from exc
     if num <= 0:
         raise ValueError(f"Bitrate muss größer als 0 sein: {value}")
+    mbit = num / 1000.0 if unit == "k" else num
+    if mbit > _MAX_VIDEO_BITRATE_MBIT:
+        raise ValueError(
+            f"Video-Bitrate {mbit:g} Mbit/s ist zu hoch "
+            f"(max {_MAX_VIDEO_BITRATE_MBIT:g} Mbit/s für NVENC). "
+            f"Feld ist kbit/s — für 20 Mbit/s „20000“ eintragen."
+        )
     text = str(int(num)) if num.is_integer() else f"{num:g}"
     return f"{text}{unit}"
 
 
 def normalize_audio_bitrate(value: str | None) -> str:
-    """Bare numbers are kbit/s (``192`` → ``192k``)."""
-    return normalize_bitrate(value or "192", default_unit="k") or "192k"
+    """Bare numbers are kbit/s (``320`` → ``320k``)."""
+    return normalize_bitrate(value or "320", default_unit="k") or "320k"
 
 
 def audio_encode_args(settings: EncodeSettings | None = None) -> list[str]:

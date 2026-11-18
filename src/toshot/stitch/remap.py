@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from toshot.math3d import EQ_TO_DJI, quat_to_matrix
+from toshot.math3d import EQ_TO_DJI, quat_to_matrix, rotvec_to_matrix
 from toshot.source.models import LensParams
 
 # Fallback when per-lens FOV cannot be measured (legacy / incomplete calib).
@@ -70,22 +70,35 @@ class SphereFov:
         return self.fov_rear + self.fov_front - 180.0
 
 
-def sphere_fov_for_pair(rear: LensParams, front: LensParams) -> SphereFov:
+def sphere_fov_for_pair(
+    rear: LensParams,
+    front: LensParams,
+    *,
+    rear_on_top: bool = False,
+) -> SphereFov:
     """
-    Sphere sized to the rear lens FOV; the front lens overlaps into it.
+    Size the sphere to one lens; the other overlaps into it.
 
-    Rear is used up to its own image-circle edge and fades out only in a thin
-    ring at that edge. Front stays at full weight through the overlap and only
-    fades at its own rim, so the front covers the rear's edge instead of both
-    being clipped to a common angle.
+    Osmo (rear_on_top=False): sphere = rear FOV, front stays full through the
+    overlap and covers the rear rim.
+
+    Avata (rear_on_top=True): sphere = front FOV; both keep full weight through
+    their FOV (hard-cut picks ownership).
     """
     fr = float(max(90.0, min(lens_max_fov_deg(rear) - _FOV_EDGE_MARGIN_DEG, 120.0)))
     ff = float(max(90.0, min(lens_max_fov_deg(front) - _FOV_EDGE_MARGIN_DEG, 120.0)))
-    rear_outer = fr
-    rear_inner = max(80.0, fr - _BLEND_RING_DEG)
-    front_outer = ff
-    front_inner = max(80.0, ff - 0.5)
-    return SphereFov(fr, ff, rear_inner, rear_outer, front_inner, front_outer)
+    if rear_on_top:
+        front_outer = ff
+        front_inner = max(80.0, ff - 0.5)
+        rear_outer = fr
+        rear_inner = max(80.0, fr - 0.5)
+    else:
+        # Sphere = rear FOV; front covers the meet with full weight.
+        rear_outer = fr
+        rear_inner = max(80.0, fr - _BLEND_RING_DEG)
+        front_outer = ff
+        front_inner = max(80.0, ff - 0.5)
+    return SphereFov(rear_outer, front_outer, rear_inner, rear_outer, front_inner, front_outer)
 
 _EQ_TO_DJI = EQ_TO_DJI
 _quat_to_mat = quat_to_matrix
@@ -139,8 +152,13 @@ def _world_to_lens_matrix(
                 s = math.sin(math.radians(FRONT_YAW_TRIM_DEG))
                 rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
                 return _quat_to_mat(q_rel) @ R0 @ rz, True
-            return _osvplat_world_to_cam(lens.yaw_deg, lens.pitch_deg, lens.roll_deg), True
-        return R0, True
+            # No usable quaternion (Avata 360): the front lens' camd pitch/roll
+            # are mirrored vs the rear's (seam patch matching on Osmo + Avata).
+            R1 = _osvplat_world_to_cam(lens.yaw_deg, 180.0 - lens.pitch_deg, -lens.roll_deg)
+            trim = _EQ_TO_DJI @ rotvec_to_matrix(lens.trim_eq_deg) @ _EQ_TO_DJI.T
+            return R1 @ trim, True
+        trim0 = _EQ_TO_DJI @ rotvec_to_matrix(lens.trim_eq_deg) @ _EQ_TO_DJI.T
+        return R0 @ trim0, True
 
     # Legacy / Insta: euler YPR as lens→world, invert for world→lens
     euler_mag = abs(lens.yaw_deg) + abs(lens.pitch_deg) + abs(lens.roll_deg)

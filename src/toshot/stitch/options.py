@@ -20,6 +20,9 @@ class StitchOptions:
     seam_blend_px: int = 5
     # Expand seam strip for near-field parallax align + hard cut (full-res px)
     seam_expand_px: int = 120
+    # Lenses look up/down (Avata 360): the lens-frame poles lie on the horizon,
+    # so no single-lens pole / selfie-stick nadir in the lens frame.
+    vertical_lenses: bool = False
 
     @property
     def advanced(self) -> bool:

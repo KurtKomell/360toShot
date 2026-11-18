@@ -49,6 +49,9 @@ class LensParams:
     yaw_deg: float = 0.0
     pitch_deg: float = 0.0
     roll_deg: float = 0.0
+    # Measured residual rotation (deg, rotation vector in equirect x/y/z axes)
+    # applied on top of the camd pose when the camera's quaternion is unusable.
+    trim_eq_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import struct
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -10,16 +11,15 @@ import numpy as np
 import wgpu
 from rendercanvas.glfw import RenderCanvas, loop
 
-from toshot.math3d import Stabilizer
+from toshot.math3d import Stabilizer, lens_axes_vertical
 from toshot.preview.decode import DualLensDecoder, choose_preview_media
 from toshot.preview.shaders import EQUIRECT_LOOK_SHADER, VIEWPORT_SHADER
 from toshot.source.models import Capture, StabMode
 from toshot.stitch.advanced import blend_advanced
 from toshot.stitch.options import StitchOptions
-from toshot.stitch.pipeline import _scale_lens
+from toshot.stitch.pipeline import _build_pair_maps, _scale_lens
 from toshot.stitch.remap import (
     blend_weights,
-    build_lens_maps,
     feather_px_for,
     sphere_fov_for_pair,
 )
@@ -73,6 +73,13 @@ def run_preview(
     With advanced options: CPU optical-flow seam, then equirect look on GPU.
     """
     opts = options or StitchOptions()
+    if lens_axes_vertical(capture.attitude or []):
+        # Rolling shutter uses Euler YPR rates; at ~90° pitch those rates
+        # gimbal-lock and warp every frame (preview logs: ±50–150 °/s).
+        opts = replace(opts, vertical_lenses=True, rolling_shutter=False)
+        log.info(
+            "Linsen schauen oben/unten (Gyro) → Naht am Horizont, Rolling-Shutter aus"
+        )
     use_adv = opts.advanced
     path, kind = choose_preview_media(capture)
     log.info(
@@ -85,7 +92,6 @@ def run_preview(
         opts.selfie_mask,
         opts.rolling_shutter,
     )
-
     rear = capture.calibration.rear
     front = capture.calibration.front or rear
     if rear is None:
@@ -109,32 +115,24 @@ def run_preview(
 
     rear_s = _scale_lens(rear, lens_edge, lens_edge)
     front_s = _scale_lens(front, lens_edge, lens_edge)
-    sf = sphere_fov_for_pair(rear_s, front_s)
+    sf = sphere_fov_for_pair(rear_s, front_s, rear_on_top=opts.vertical_lenses)
     log.info(
-        "Baue GPU-Remap-Maps %dx%d (lens %d)  Kugel=Rear-FOV %.2f°, Front %.2f° überlappt %.1f° …",
+        "Baue GPU-Remap-Maps %dx%d (lens %d)  Kugel=%s-FOV %.2f°, %s %.2f° darüber (%.1f°) …",
         equirect_w,
         equirect_h,
         lens_edge,
-        sf.fov_rear,
-        sf.fov_front,
+        "Front" if opts.vertical_lenses else "Rear",
+        sf.fov_front if opts.vertical_lenses else sf.fov_rear,
+        "Rear" if opts.vertical_lenses else "Front",
+        sf.fov_rear if opts.vertical_lenses else sf.fov_front,
         sf.overlap_deg,
     )
-    x0, y0, w0 = build_lens_maps(
+    x0, y0, w0, x1, y1, w1 = _build_pair_maps(
         rear_s,
-        equirect_w,
-        equirect_h,
-        fov_deg=sf.fov_rear,
-        blend_inner_deg=sf.rear_inner,
-        blend_outer_deg=sf.rear_outer,
-    )
-    x1, y1, w1 = build_lens_maps(
         front_s,
         equirect_w,
         equirect_h,
-        ref_lens=rear_s,
-        fov_deg=sf.fov_front,
-        blend_inner_deg=sf.front_inner,
-        blend_outer_deg=sf.front_outer,
+        rear_on_top=opts.vertical_lenses,
     )
     a, b = blend_weights(w0, w1, feather_px=feather_px_for(equirect_w))
     a = np.nan_to_num(a).astype(np.float32)

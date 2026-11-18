@@ -19,7 +19,7 @@ def encoders(monkeypatch):
 
 
 def test_normalize_bitrate_units():
-    assert normalize_bitrate("80") == "80M"
+    assert normalize_bitrate("80000") == "80000k"
     assert normalize_bitrate("80M") == "80M"
     assert normalize_bitrate(" 12.5 m ") == "12.5M"
     assert normalize_bitrate("1500k") == "1500k"
@@ -27,10 +27,18 @@ def test_normalize_bitrate_units():
     assert normalize_bitrate("  ") is None
     assert normalize_audio_bitrate("192") == "192k"
     assert normalize_audio_bitrate("256K") == "256k"
+    assert normalize_audio_bitrate(None) == "320k"
+    assert normalize_audio_bitrate("") == "320k"
     with pytest.raises(ValueError):
         normalize_bitrate("0")
     with pytest.raises(ValueError):
         normalize_bitrate("schnell")
+    with pytest.raises(ValueError, match="Mbit/s"):
+        normalize_bitrate("20000M")  # NVENC maxrate overflow
+    with pytest.raises(ValueError, match="Mbit/s"):
+        normalize_bitrate("600000")  # 600 Mbit/s as kbit
+    assert normalize_bitrate("20000") == "20000k"
+    assert normalize_bitrate("500000") == "500000k"
 
 
 def test_default_hevc_stays_crf(encoders):
@@ -45,12 +53,12 @@ def test_bitrate_overrides_crf_and_prefers_nvenc(encoders):
     enc = choose_video_encoder(
         prefer_hevc=True,
         bit_depth=10,
-        settings=EncodeSettings(codec="hevc", crf=18, bitrate="80", preset="slow"),
+        settings=EncodeSettings(codec="hevc", crf=18, bitrate="80000", preset="slow"),
     )
     assert enc.video == "hevc_nvenc"
-    assert enc.extra[enc.extra.index("-b:v") + 1] == "80M"
-    assert enc.extra[enc.extra.index("-maxrate") + 1] == "80M"
-    assert enc.extra[enc.extra.index("-bufsize") + 1] == "160M"
+    assert enc.extra[enc.extra.index("-b:v") + 1] == "80000k"
+    assert enc.extra[enc.extra.index("-maxrate") + 1] == "80000k"
+    assert enc.extra[enc.extra.index("-bufsize") + 1] == "160000k"
     assert "-qp" not in enc.extra
     assert "-crf" not in enc.extra
     assert enc.extra[enc.extra.index("-preset") + 1] == "slow"
@@ -99,9 +107,9 @@ def test_shot_auto_stays_h264(encoders):
 
 
 def test_libx264_fallback_keeps_bitrate():
-    enc = libx264_encoder(EncodeSettings(bitrate="60", preset="veryfast", crf=18))
+    enc = libx264_encoder(EncodeSettings(bitrate="60000", preset="veryfast", crf=18))
     assert enc.video == "libx264"
-    assert enc.extra[enc.extra.index("-b:v") + 1] == "60M"
+    assert enc.extra[enc.extra.index("-b:v") + 1] == "60000k"
     assert enc.extra[enc.extra.index("-preset") + 1] == "veryfast"
 
 
@@ -122,7 +130,7 @@ def test_cli_encode_flags():
             "--codec",
             "hevc",
             "--bitrate",
-            "80",
+            "80000",
             "--crf",
             "20",
             "--preset",
@@ -135,7 +143,7 @@ def test_cli_encode_flags():
     )
     cfg = _encode_settings(args)
     assert cfg.codec == "hevc"
-    assert cfg.bitrate == "80M"
+    assert cfg.bitrate == "80000k"
     assert cfg.crf == 20
     assert cfg.preset == "slow"
     assert cfg.bit_depth == 10

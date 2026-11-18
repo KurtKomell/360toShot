@@ -78,6 +78,37 @@ def discover_jobs(folder: Path) -> list[CaptureJob]:
     return group_jobs(files)
 
 
+def jobs_total_duration(jobs: list[CaptureJob]) -> tuple[float, list[tuple[str, float]]]:
+    """
+    Sum media durations via ffprobe. Prefers proxy (.LRF/.lrv) when present
+    (faster on NAS); falls back to master. Returns (total_s, [(id, dur_s), …]).
+    """
+    from toshot.ffmpeg_bin import probe_duration
+
+    rows: list[tuple[str, float]] = []
+    total = 0.0
+    for job in jobs:
+        src = job.proxy if job.proxy is not None else job.master
+        try:
+            dur = probe_duration(src)
+        except Exception as exc:
+            log.warning("Dauer nicht lesbar (%s): %s", src.name, exc)
+            dur = 0.0
+        rows.append((job.id, dur))
+        total += dur
+    return total, rows
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds as H:MM:SS (or M:SS if under one hour)."""
+    s = int(round(max(0.0, seconds)))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
 def group_jobs(files: list[Path]) -> list[CaptureJob]:
     files = [normalize_path(f) for f in files]
     used: set[Path] = set()

@@ -17,7 +17,12 @@ from toshot.export.equirect import export_equirect
 from toshot.export.shot import export_shot
 from toshot.gui.log_bridge import StdRedirect, install_gui_logging
 from toshot.source.group import resolve_path
-from toshot.source.jobs import discover_jobs, job_for_path
+from toshot.source.jobs import (
+    discover_jobs,
+    format_duration,
+    job_for_path,
+    jobs_total_duration,
+)
 from toshot.source.models import StabMode
 from toshot.ffmpeg_bin import EncodeSettings, normalize_audio_bitrate, normalize_bitrate
 from toshot.stitch.options import StitchOptions
@@ -87,7 +92,7 @@ class ToshotApp(ctk.CTk):
         self._bitrate = ctk.StringVar(value="")
         self._preset = ctk.StringVar(value="medium")
         self._depth = ctk.StringVar(value="auto")
-        self._audio = ctk.StringVar(value="192")
+        self._audio = ctk.StringVar(value="320")
         self._status = ctk.StringVar(value="Bereit")
 
         self._build()
@@ -271,7 +276,7 @@ class ToshotApp(ctk.CTk):
         self._labeled(enc, 0, 0, "Codec", self._codec, list(_CODEC_LABELS))
         self._labeled(enc, 0, 1, "Steuerung", self._rate, list(_RATE_LABELS))
         self._entry(enc, 1, 0, "CRF (0–51, kleiner = besser)", self._crf)
-        self._entry(enc, 1, 1, "Bitrate (Mbit/s)", self._bitrate, placeholder="80")
+        self._entry(enc, 1, 1, "Bitrate (kbit/s, z.B. 20000)", self._bitrate, placeholder="80000")
         self._labeled(enc, 2, 0, "Preset", self._preset, ["veryfast", "fast", "medium", "slow"])
         self._labeled(enc, 2, 1, "Farbtiefe", self._depth, ["auto", "8", "10"])
         self._entry(enc, 3, 0, "Audio (kbit/s)", self._audio)
@@ -397,7 +402,7 @@ class ToshotApp(ctk.CTk):
         if mode == "bitrate":
             raw = self._bitrate.get().strip()
             if not raw:
-                raise ValueError("Bitte eine Video-Bitrate in Mbit/s angeben")
+                raise ValueError("Bitte eine Video-Bitrate in kbit/s angeben")
             bitrate = normalize_bitrate(raw)
         depth_txt = self._depth.get()
         if depth_txt not in {"auto", "8", "10"}:
@@ -407,7 +412,7 @@ class ToshotApp(ctk.CTk):
             crf=crf,
             bitrate=bitrate,
             preset=self._preset.get() or "medium",
-            audio_bitrate=normalize_audio_bitrate(self._audio.get().strip() or "192"),
+            audio_bitrate=normalize_audio_bitrate(self._audio.get().strip() or "320"),
             bit_depth=None if depth_txt == "auto" else int(depth_txt),
         )
 
@@ -551,19 +556,55 @@ class ToshotApp(ctk.CTk):
         if not src:
             messagebox.showinfo("toshot", "Bitte zuerst einen Ordner wählen.")
             return
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo("toshot", "Es läuft bereits ein Job.")
+            return
         path = Path(src)
         folder = path if path.is_dir() else path.parent
+        self._status.set("Captures zählen / Dauer lesen…")
+        self._worker = threading.Thread(
+            target=self._list_captures_worker, args=(folder,), daemon=True
+        )
+        self._worker.start()
+
+    def _list_captures_worker(self, folder: Path) -> None:
         try:
             jobs = discover_jobs(folder)
-        except Exception as exc:
-            messagebox.showerror("toshot", str(exc))
-            return
-        self._append_log(f"— {len(jobs)} Capture(s) in {folder} (nur Dateinamen, kein Parse)")
-        for j in jobs:
-            self._append_log(
-                f"  {j.id}  [{j.kind}]  master={j.master.name}  "
-                f"proxy={j.proxy.name if j.proxy else '-'}"
+            if not jobs:
+                kids = list(folder.iterdir())
+                self._log_q.put(
+                    f"— 0 Captures in {folder} "
+                    f"({'leer' if not kids else f'{len(kids)} andere Einträge, keine Medien'})"
+                )
+                self._status_safe("Keine .OSV/.LRF/.insv/.lrv gefunden")
+                hint = (
+                    f"Keine .OSV/.LRF/.insv/.lrv in:\n{folder}\n\n"
+                    + (
+                        "Ordner ist komplett leer."
+                        if not kids
+                        else "Nur andere Dateien/Unterordner."
+                    )
+                )
+                self.after(0, lambda h=hint: messagebox.showinfo("toshot Batch", h))
+                return
+            self._log_q.put(f"— {len(jobs)} Capture(s) in {folder}")
+            self._status_safe(f"Dauer lesen ({len(jobs)} Clips)…")
+            total_s, rows = jobs_total_duration(jobs)
+            for j, (_id, dur) in zip(jobs, rows):
+                self._log_q.put(
+                    f"  {format_duration(dur):>8}  {j.id}  [{j.kind}]  "
+                    f"master={j.master.name}  proxy={j.proxy.name if j.proxy else '-'}"
+                )
+            summary = (
+                f"Gesamt: {len(jobs)} Clips · {format_duration(total_s)} "
+                f"({total_s / 60.0:.1f} min)"
             )
+            self._log_q.put(f"— {summary}")
+            self._status_safe(summary)
+        except Exception as exc:
+            self._log_q.put(f"Fehler: {exc}")
+            self._status_safe("Fehler beim Listen")
+            self.after(0, lambda e=str(exc): messagebox.showerror("toshot", e))
 
     def _on_cancel(self) -> None:
         self._stop.set()
@@ -699,8 +740,34 @@ class ToshotApp(ctk.CTk):
                 if path.is_dir():
                     log.info("Suche Captures im Ordner (schnell, ohne Parse)…")
                     jobs = discover_jobs(path)
+                    if jobs:
+                        self._status_safe(f"Dauer lesen ({len(jobs)} Clips)…")
+                        total_s, _rows = jobs_total_duration(jobs)
+                        summary = (
+                            f"{len(jobs)} Clips · Gesamtdauer {format_duration(total_s)} "
+                            f"({total_s / 60.0:.1f} min)"
+                        )
+                        log.info("%s", summary)
+                        self._log_q.put(f"— Batch {summary}")
+                        self._status_safe(f"Batch: {summary}")
                     if not jobs:
-                        self._status_safe("Keine .OSV/.LRF/.insv/.lrv im Ordner")
+                        other = sorted(
+                            p.name for p in path.iterdir() if p.is_file() or p.is_dir()
+                        )[:12]
+                        hint = (
+                            f"Keine .OSV/.LRF/.insv/.lrv in:\n{path}\n\n"
+                            "Ordner ist leer oder enthält nur andere Dateien.\n"
+                            "Bitte den Ordner mit den Master-Clips wählen "
+                            "(nicht den Ausgabe-Ordner)."
+                        )
+                        if other:
+                            hint += "\n\nGefunden: " + ", ".join(other)
+                        else:
+                            hint += "\n\n(Ordner ist komplett leer.)"
+                        log.warning("%s", hint.replace("\n", " | "))
+                        self._log_q.put(hint)
+                        self.after(0, lambda h=hint: messagebox.showinfo("toshot Batch", h))
+                        self._status_safe("Keine Captures im Ordner")
                         return
                     if do_inspect:
                         for i, job in enumerate(jobs, 1):
